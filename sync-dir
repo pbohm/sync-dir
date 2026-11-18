@@ -6,12 +6,15 @@
 #  - nothing is ever deleted: files missing in the source and old versions of
 #    replaced files are moved to <destination>/.deleted/<timestamp>/
 #  - every run starts with a dry run and prints a report of the changes
+#  - DISABLE_DELETE=1 (or -d): no file is ever moved or deleted, .deleted is not
+#    used; extra files stay, updated files are overwritten in place
 #
-# Usage: sync-dir [push|pull] [-n] [-y] [-k] [-c config_file]
+# Usage: sync-dir [push|pull] [-n] [-y] [-k] [-d] [-c config_file]
 #   push|pull  direction (default: DIRECTION below)
 #   -n         dry run only: print the report, change nothing
 #   -y         apply without asking for confirmation
 #   -k         keep extra files in the destination (do not move them to .deleted)
+#   -d         disable deleting: nothing is moved or deleted (implies -k, no .deleted)
 #   -c FILE    load configuration from FILE (same variables as below)
 #   -h         help
 
@@ -26,19 +29,22 @@ SSH_KEY=""                    # e.g. "$HOME/.ssh/id_ed25519"; empty = ssh defaul
 REMOTE_RSYNC="rsync"          # rsync binary on the remote host
 DIRECTION="push"              # push = local -> remote, pull = remote -> local
 MIRROR_DELETES=1              # 1 = files missing in source go to .deleted; 0 = leave them alone
+DISABLE_DELETE=0              # 1 = never move or delete any file: no --delete, no backups to
+                              #     .deleted (old versions of updated files are overwritten)
 DELETED_DIR=".deleted"
 EXCLUDES=(".DS_Store" "*.swp")
 # ------------------------------------------------------------------------------------
 
-usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
-DRY_RUN=0; ASSUME_YES=0; CONFIG=""; CLI_DIRECTION=""; CLI_KEEP=0
+DRY_RUN=0; ASSUME_YES=0; CONFIG=""; CLI_DIRECTION=""; CLI_KEEP=0; CLI_NODEL=0
 while [ $# -gt 0 ]; do
   case "$1" in
     push|pull) CLI_DIRECTION="$1" ;;
     -n) DRY_RUN=1 ;;
     -y) ASSUME_YES=1 ;;
     -k) CLI_KEEP=1 ;;
+    -d) CLI_NODEL=1 ;;
     -c) CONFIG="${2:?-c needs a file}"; shift ;;
     -h|--help) usage 0 ;;
     *) echo "Unknown argument: $1" >&2; usage 1 ;;
@@ -52,6 +58,8 @@ if [ -n "$CONFIG" ]; then
 fi
 [ -n "$CLI_DIRECTION" ] && DIRECTION="$CLI_DIRECTION"
 [ "$CLI_KEEP" = 1 ] && MIRROR_DELETES=0
+[ "$CLI_NODEL" = 1 ] && DISABLE_DELETE=1
+[ "$DISABLE_DELETE" = 1 ] && MIRROR_DELETES=0
 
 # --- rsync binary: needs real rsync 3.x (macOS /usr/bin/rsync is openrsync) ---
 if [ -z "${RSYNC_BIN:-}" ]; then
@@ -83,9 +91,11 @@ SSH_CMD="ssh -p $SSH_PORT"
 [ -n "$SSH_KEY" ] && SSH_CMD="$SSH_CMD -i $SSH_KEY"
 
 OPTS=(-rlpt --update --itemize-changes --stats --human-readable
-      --backup "--backup-dir=$DELETED_DIR/$STAMP"   # relative to the destination root
       "--exclude=/$DELETED_DIR/"                    # never sync or touch .deleted itself
       -e "$SSH_CMD" "--rsync-path=$REMOTE_RSYNC")
+if [ "$DISABLE_DELETE" != 1 ]; then
+  OPTS+=(--backup "--backup-dir=$DELETED_DIR/$STAMP")   # relative to the destination root
+fi
 [ "$MIRROR_DELETES" = 1 ] && OPTS+=(--delete)
 for e in "${EXCLUDES[@]}"; do OPTS+=("--exclude=$e"); done
 
@@ -115,7 +125,11 @@ report() {
   DIRS="$(pick '^cd\+{9}')"
   echo "=== $1: $DIRECTION  $SRC  ->  $DST ==="
   section "New files" "+" "$NEW"
-  section "Updated files (old version -> $DELETED_DIR/$STAMP)" "~" "$UPD"
+  if [ "$DISABLE_DELETE" = 1 ]; then
+    section "Updated files (overwritten, no backup)" "~" "$UPD"
+  else
+    section "Updated files (old version -> $DELETED_DIR/$STAMP)" "~" "$UPD"
+  fi
   section "Moved to $DELETED_DIR/$STAMP (missing in source)" "-" "$DEL"
   section "New directories" "d" "$DIRS"
   TOTAL=$(( $(count "$NEW") + $(count "$UPD") + $(count "$DEL") + $(count "$DIRS") ))

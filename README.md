@@ -28,6 +28,7 @@ Edit the variables at the top of `sync-dir`, or put the same variables in a conf
 | `REMOTE_RSYNC` | `rsync` | rsync binary on the remote host |
 | `DIRECTION` | `push` | Default direction: `push` or `pull` |
 | `MIRROR_DELETES` | `1` | `1` moves destination files that are missing in the source to `.deleted`. `0` leaves them in place. |
+| `DISABLE_DELETE` | `0` | `1` never moves or deletes any destination file: extra files stay in place and updated files are overwritten without a backup in `.deleted`. Overrides `MIRROR_DELETES`. |
 | `DELETED_DIR` | `.deleted` | Name of the backup folder inside the destination |
 | `EXCLUDES` | `(".DS_Store" "*.swp")` | rsync exclude patterns. Excluded files are never touched in the destination. |
 
@@ -44,7 +45,7 @@ EXCLUDES=(".DS_Store" "*.swp" "node_modules/" ".git/")
 ## Usage
 
 ```text
-sync-dir [push|pull] [-n] [-y] [-k] [-c config_file]
+sync-dir [push|pull] [-n] [-y] [-k] [-d] [-c config_file]
 ```
 
 | Option | Meaning |
@@ -53,6 +54,7 @@ sync-dir [push|pull] [-n] [-y] [-k] [-c config_file]
 | `-n` | Dry run only: print the report and change nothing |
 | `-y` | Apply without asking for confirmation |
 | `-k` | Keep extra destination files instead of moving them to `.deleted` |
+| `-d` | Disable deleting: nothing is moved or deleted, `.deleted` is not used. Same as `DISABLE_DELETE=1`. |
 | `-c FILE` | Load configuration from `FILE` |
 | `-h` | Help |
 
@@ -63,6 +65,7 @@ sync-dir push -n -c ~/work.conf   # preview local -> remote
 sync-dir push -c ~/work.conf      # preview, confirm, apply
 sync-dir pull -y -c ~/work.conf   # remote -> local, no question
 sync-dir pull -k -c ~/work.conf   # pull, keep local files missing on the remote
+sync-dir push -d -c ~/work.conf   # push, never move or delete anything in the destination
 ```
 
 ## Report
@@ -95,6 +98,7 @@ The script runs rsync with these options:
 - `--update` skips files that are newer in the destination.
 - `--delete` together with `--backup-dir` moves files into `.deleted/<timestamp>/` instead of deleting them. The same happens to the previous version of every overwritten file.
 - `.deleted` is excluded, so it is never synced or cleaned up by the script.
+- With `DISABLE_DELETE=1`, neither `--delete` nor `--backup` is used, so the old version of an updated file is lost.
 - Owner and group are not copied (`-rlpt`), so the sync works between machines with different users.
 
 ## Limitations
