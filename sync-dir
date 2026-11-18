@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# sync-dir - sync a local folder with a remote folder over SSH (rsync).
+#
+#  - push (local -> remote) or pull (remote -> local), switched with one word
+#  - only newer files replace older ones (rsync --update, compares mtime)
+#  - nothing is ever deleted: files missing in the source and old versions of
+#    replaced files are moved to <destination>/.deleted/<timestamp>/
+#  - every run starts with a dry run and prints a report of the changes
+#
+# Usage: sync-dir [push|pull] [-n] [-y] [-k] [-c config_file]
+#   push|pull  direction (default: DIRECTION below)
+#   -n         dry run only: print the report, change nothing
+#   -y         apply without asking for confirmation
+#   -k         keep extra files in the destination (do not move them to .deleted)
+#   -c FILE    load configuration from FILE (same variables as below)
+#   -h         help
+
+set -euo pipefail
+
+# ---------------- configuration (or put these in a file and use -c) ----------------
+LOCAL_DIR="$HOME/sync/project"
+REMOTE_HOST="user@server.example.com"   # empty = REMOTE_DIR is a local path (for testing)
+REMOTE_DIR="/home/user/sync/project"
+SSH_PORT=22
+SSH_KEY=""                    # e.g. "$HOME/.ssh/id_ed25519"; empty = ssh defaults / agent
+REMOTE_RSYNC="rsync"          # rsync binary on the remote host
+DIRECTION="push"              # push = local -> remote, pull = remote -> local
+MIRROR_DELETES=1              # 1 = files missing in source go to .deleted; 0 = leave them alone
+DELETED_DIR=".deleted"
+EXCLUDES=(".DS_Store" "*.swp")
+# ------------------------------------------------------------------------------------
+
+usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+DRY_RUN=0; ASSUME_YES=0; CONFIG=""; CLI_DIRECTION=""; CLI_KEEP=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    push|pull) CLI_DIRECTION="$1" ;;
+    -n) DRY_RUN=1 ;;
+    -y) ASSUME_YES=1 ;;
+    -k) CLI_KEEP=1 ;;
+    -c) CONFIG="${2:?-c needs a file}"; shift ;;
+    -h|--help) usage 0 ;;
+    *) echo "Unknown argument: $1" >&2; usage 1 ;;
+  esac
+  shift
+done
+
+if [ -n "$CONFIG" ]; then
+  # shellcheck source=/dev/null
+  . "$CONFIG"
+fi
+[ -n "$CLI_DIRECTION" ] && DIRECTION="$CLI_DIRECTION"
+[ "$CLI_KEEP" = 1 ] && MIRROR_DELETES=0
+
+# --- rsync binary: needs real rsync 3.x (macOS /usr/bin/rsync is openrsync) ---
+if [ -z "${RSYNC_BIN:-}" ]; then
+  for c in /opt/homebrew/bin/rsync /usr/local/bin/rsync rsync; do
+    if command -v "$c" >/dev/null 2>&1; then RSYNC_BIN="$c"; break; fi
+  done
+fi
+if "$RSYNC_BIN" --version 2>&1 | head -1 | grep -qi openrsync; then
+  echo "Error: $RSYNC_BIN is openrsync; install GNU rsync (brew install rsync)." >&2
+  exit 1
+fi
+
+# --- sanity checks (we use --delete, so be strict about paths) ---
+for d in "$LOCAL_DIR" "$REMOTE_DIR"; do
+  case "$d" in ""|"/") echo "Error: refusing to sync with empty path or '/'." >&2; exit 1 ;; esac
+done
+case "$DIRECTION" in push|pull) ;; *) echo "Error: DIRECTION must be push or pull." >&2; exit 1 ;; esac
+if [ "$DIRECTION" = push ] && [ ! -d "$LOCAL_DIR" ]; then
+  echo "Error: local folder $LOCAL_DIR does not exist." >&2; exit 1
+fi
+
+# --- endpoints ---
+if [ -n "$REMOTE_HOST" ]; then REMOTE="$REMOTE_HOST:${REMOTE_DIR%/}/"; else REMOTE="${REMOTE_DIR%/}/"; fi
+LOCAL="${LOCAL_DIR%/}/"
+if [ "$DIRECTION" = push ]; then SRC="$LOCAL"; DST="$REMOTE"; else SRC="$REMOTE"; DST="$LOCAL"; mkdir -p "$LOCAL_DIR"; fi
+
+STAMP="$(date +%Y-%m-%d_%H%M%S)"
+SSH_CMD="ssh -p $SSH_PORT"
+[ -n "$SSH_KEY" ] && SSH_CMD="$SSH_CMD -i $SSH_KEY"
+
+OPTS=(-rlpt --update --itemize-changes --stats --human-readable
+      --backup "--backup-dir=$DELETED_DIR/$STAMP"   # relative to the destination root
+      "--exclude=/$DELETED_DIR/"                    # never sync or touch .deleted itself
+      -e "$SSH_CMD" "--rsync-path=$REMOTE_RSYNC")
+[ "$MIRROR_DELETES" = 1 ] && OPTS+=(--delete)
+for e in "${EXCLUDES[@]}"; do OPTS+=("--exclude=$e"); done
+
+LOG="$(mktemp)"; trap 'rm -f "$LOG"' EXIT
+
+run_rsync() {
+  local rc=0
+  "$RSYNC_BIN" "${OPTS[@]}" "$@" "$SRC" "$DST" >"$LOG" 2>&1 || rc=$?
+  if [ "$rc" -ne 0 ] && [ "$rc" -ne 24 ]; then   # 24 = some source files vanished: warning only
+    cat "$LOG" >&2; echo "rsync failed with exit code $rc" >&2; exit "$rc"
+  fi
+}
+
+# itemize format: 11-char change code, a space, then the path (column 13)
+pick() { grep -E "$1" "$LOG" | cut -c13- || true; }
+count() { if [ -z "$1" ]; then echo 0; else printf '%s\n' "$1" | wc -l | tr -d ' '; fi; }
+section() {  # title, marker, list
+  [ -z "$3" ] && return 0
+  echo "$1 ($(count "$3")):"
+  printf '%s\n' "$3" | sed "s/^/  $2 /"
+}
+
+report() {
+  NEW="$(pick '^[<>]f\+{9}')"
+  UPD="$(grep -E '^[<>]f' "$LOG" | grep -vE '^[<>]f\+{9}' | cut -c13- || true)"
+  DEL="$(pick '^\*deleting')"
+  DIRS="$(pick '^cd\+{9}')"
+  echo "=== $1: $DIRECTION  $SRC  ->  $DST ==="
+  section "New files" "+" "$NEW"
+  section "Updated files (old version -> $DELETED_DIR/$STAMP)" "~" "$UPD"
+  section "Moved to $DELETED_DIR/$STAMP (missing in source)" "-" "$DEL"
+  section "New directories" "d" "$DIRS"
+  TOTAL=$(( $(count "$NEW") + $(count "$UPD") + $(count "$DEL") + $(count "$DIRS") ))
+  [ "$TOTAL" -eq 0 ] && echo "No changes."
+  grep -E '^Total transferred file size' "$LOG" || true
+  grep -iE 'vanished|warning' "$LOG" || true
+}
+
+run_rsync --dry-run
+report "DRY RUN"
+[ "$DRY_RUN" = 1 ] && exit 0
+[ "$TOTAL" -eq 0 ] && exit 0
+
+if [ "$ASSUME_YES" != 1 ]; then
+  printf 'Apply these changes? [y/N] '
+  read -r answer
+  case "$answer" in y|Y|yes|YES) ;; *) echo "Aborted."; exit 0 ;; esac
+fi
+
+run_rsync
+echo
+report "APPLIED"
